@@ -21,6 +21,13 @@ public class KeywordSegmentContentRetriever implements ContentRetriever {
     private final List<AigcKnowledge> knowledges;
     private final int topK;
 
+    /**
+     * 构造关键词检索器。
+     *
+     * @param knowledgeSearchService 知识检索服务，负责底层切片表检索
+     * @param knowledges 本次对话绑定的知识库列表（空列表时检索无结果）
+     * @param topK 每次检索召回的最大条数
+     */
     public KeywordSegmentContentRetriever(
             KnowledgeSearchService knowledgeSearchService,
             List<AigcKnowledge> knowledges,
@@ -31,6 +38,9 @@ public class KeywordSegmentContentRetriever implements ContentRetriever {
         this.topK = topK;
     }
 
+    /**
+     * 执行关键词检索：按用户问题在绑定知识库的切片中匹配，转换为 LangChain4j Content。
+     */
     @Override
     public List<Content> retrieve(Query query) {
         return knowledgeSearchService.search(knowledges, query.text(), topK).stream()
@@ -38,6 +48,7 @@ public class KeywordSegmentContentRetriever implements ContentRetriever {
                 .toList();
     }
 
+    /** 将知识库命中结果转换为 LangChain4j Content：正文作为文本段、元数据原样透传。 */
     private Content toContent(KnowledgeSearchHit hit) {
         Metadata metadata = Metadata.from(hit.getMetadata() == null ? java.util.Map.of() : hit.getMetadata());
         return Content.from(TextSegment.from(hit.getContent(), metadata));

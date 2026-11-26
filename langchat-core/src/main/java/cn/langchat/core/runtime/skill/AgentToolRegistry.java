@@ -29,6 +29,7 @@ public class AgentToolRegistry {
     public Map<ToolSpecification, ToolExecutor> buildTools(List<AigcSkill> skills, AgentToolContext baseContext) {
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (AigcSkill skill : skills) {
+            // 找到第一个支持该 Skill 的提供器，用「当前 skill + 会话/用户/知识库」构建独立工具上下文
             providers.stream()
                     .filter(provider -> provider.supports(skill))
                     .findFirst()
@@ -40,7 +41,9 @@ public class AgentToolRegistry {
                             baseContext.knowledges()
                     )))
                     .ifPresentOrElse(
+                            // 命中：注册工具规格与执行器，供模型按需调用
                             definition -> tools.put(definition.specification(), definition.executor()),
+                            // 未命中：仅告警跳过，不中断整体构建
                             () -> log.warn("未找到 Skill 提供器，skillName={}", skill.getName())
                     );
         }

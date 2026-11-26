@@ -44,6 +44,7 @@ import org.springframework.util.StringUtils;
 @EnableScheduling
 public class McpClientManager implements DisposableBean {
 
+    /** MCP 自定义请求头的反序列化类型。 */
     private static final TypeReference<Map<String, String>> HEADERS_TYPE = new TypeReference<>() {
     };
 
@@ -59,6 +60,7 @@ public class McpClientManager implements DisposableBean {
      */
     public ToolProvider buildToolProvider(List<AigcMcp> mcps) {
         List<McpClient> clients = new ArrayList<>();
+        // 逐个获取或创建 MCP 客户端（命中 TTL 缓存则复用），单个失败只跳过该服务
         for (AigcMcp mcp : mcps) {
             try {
                 clients.add(getOrCreateClient(mcp));
@@ -66,9 +68,11 @@ public class McpClientManager implements DisposableBean {
                 log.error("MCP 客户端创建失败，已跳过，mcpId={}, name={}", mcp.getId(), mcp.getName(), exception);
             }
         }
+        // 无可用客户端时返回 null，表示本次对话不启用 MCP 工具
         if (clients.isEmpty()) {
             return null;
         }
+        // failIfOneServerFails(false)：运行期某服务失败时，其余 MCP 工具仍可正常调用
         return McpToolProvider.builder()
                 .mcpClients(clients)
                 .failIfOneServerFails(false)
@@ -110,6 +114,7 @@ public class McpClientManager implements DisposableBean {
         }
     }
 
+    /** 监听 MCP 配置变更事件（修改/暂停/删除），立即停止对应客户端连接。 */
     @EventListener
     public void onMcpConfigChanged(McpConfigChangedEvent event) {
         stopClient(event.mcpId());
@@ -128,12 +133,19 @@ public class McpClientManager implements DisposableBean {
         });
     }
 
+    /**
+     * 应用关闭时统一关闭所有 MCP 客户端，释放底层进程与网络资源。
+     */
     @Override
     public void destroy() {
         sessions.forEach((key, session) -> closeQuietly(session));
         sessions.clear();
     }
 
+    /**
+     * 创建 MCP 客户端：构建传输通道、设置工具执行超时与缓存，
+     * 并主动握手发现工具（预热连接、尽早暴露连接问题，失败即关闭并抛出）。
+     */
     private McpClient createClient(AigcMcp mcp) {
         McpTransport transport = buildTransport(mcp);
         DefaultMcpClient client = DefaultMcpClient.builder()
@@ -154,6 +166,10 @@ public class McpClientManager implements DisposableBean {
         return client;
     }
 
+    /**
+     * 按配置的传输类型构建 MCP 传输通道：SSE/HTTP 统一走 Streamable HTTP、
+     * STDIO 走 Docker 启动镜像进程；各模式所需参数缺失时抛出配置非法异常。
+     */
     private McpTransport buildTransport(AigcMcp mcp) {
         String transport = StringUtils.hasText(mcp.getTransport())
                 ? mcp.getTransport().trim().toUpperCase()
@@ -185,6 +201,9 @@ public class McpClientManager implements DisposableBean {
         };
     }
 
+    /**
+     * 组装 STDIO 模式的 Docker 运行命令：docker run --rm -i [dockerHost] <镜像>。
+     */
     private List<String> buildDockerCommand(AigcMcp mcp) {
         List<String> command = new ArrayList<>();
         command.add("docker");
@@ -199,6 +218,9 @@ public class McpClientManager implements DisposableBean {
         return command;
     }
 
+    /**
+     * 解析自定义请求头 JSON；为空或解析失败时返回空映射，不中断连接建立。
+     */
     private Map<String, String> parseHeaders(String headersJson) {
         if (!StringUtils.hasText(headersJson)) {
             return Map.of();
@@ -212,6 +234,7 @@ public class McpClientManager implements DisposableBean {
         }
     }
 
+    /** 校验 MCP 配置必须包含 ID，作为客户端缓存主键。 */
     private String requireMcpId(AigcMcp mcp) {
         if (!StringUtils.hasText(mcp.getId())) {
             throw new BizException("MCP_CONFIG_INVALID", "MCP 配置缺少 id");
@@ -232,10 +255,12 @@ public class McpClientManager implements DisposableBean {
                 String.valueOf(mcp.getTimeout() == null ? -1 : mcp.getTimeout()));
     }
 
+    /** 判断会话是否超过配置的 TTL（自最近访问时间起算）。 */
     private boolean isExpired(McpSession session) {
         return session.isExpired(mcpProperties.getSessionTtl().toMillis());
     }
 
+    /** 静默关闭客户端连接，异常仅记录日志不向上抛出。 */
     private void closeQuietly(McpSession session) {
         try {
             session.client().close();
@@ -244,6 +269,7 @@ public class McpClientManager implements DisposableBean {
         }
     }
 
+    /** null 转 空串，并去除首尾空白，用于构建配置指纹。 */
     private String nvl(String value) {
         return value == null ? "" : value.trim();
     }
@@ -257,24 +283,29 @@ public class McpClientManager implements DisposableBean {
         private final String fingerprint;
         private volatile long lastAccess;
 
+        /** 创建会话：绑定客户端与配置指纹，记录创建时间为最近访问时间。 */
         private McpSession(McpClient client, String fingerprint) {
             this.client = client;
             this.fingerprint = fingerprint;
             this.lastAccess = System.currentTimeMillis();
         }
 
+        /** 获取底层客户端实例。 */
         private McpClient client() {
             return client;
         }
 
+        /** 获取会话的配置指纹，用于判断配置是否变化。 */
         private String fingerprint() {
             return fingerprint;
         }
 
+        /** 刷新最近访问时间，延长 TTL（惰性续期）。 */
         private void touch() {
             this.lastAccess = System.currentTimeMillis();
         }
 
+        /** 判断是否超过 TTL：当前时间 - 最近访问时间 >= TTL。 */
         private boolean isExpired(long ttlMillis) {
             return System.currentTimeMillis() - lastAccess >= ttlMillis;
         }

@@ -49,6 +49,7 @@ import java.util.concurrent.ConcurrentMap;
 @Slf4j
 public class LangChain4jModelFactory {
 
+    /** 本地/私化模型（如 Ollama）无需 API Key 时使用的非空占位值，避免构建器校验报错。 */
     private static final String EMPTY_API_KEY = "EMPTY_API_KEY";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
@@ -65,7 +66,9 @@ public class LangChain4jModelFactory {
      * @param scene 调用场景，用于监控报表按业务链路区分消耗
      */
     public StreamingChatModel getStreamingChatModel(AigcModel model, AigcAgent agent, String scene) {
+        // 解析 Agent 级模型参数覆盖（温度/topP/maxTokens），agent 为空或解析失败时回退为空配置
         AgentModelConfig config = parseAgentModelConfig(agent);
+        // 缓存键 = 模型 id + 更新时间 + Agent 参数覆盖 + 调用场景，任一变化即命中新键触发重建
         String cacheKey = String.join(
                 ":",
                 model.getId(),
@@ -75,6 +78,7 @@ public class LangChain4jModelFactory {
                 String.valueOf(maxTokens(config, model)),
                 String.valueOf(scene)
         );
+        // 命中缓存直接复用，缺失时按供应商创建（含监控监听器注入）并写入缓存
         return chatModelCache.computeIfAbsent(cacheKey, key -> createStreamingChatModel(model, config, scene));
     }
 
@@ -103,11 +107,18 @@ public class LangChain4jModelFactory {
         return getEmbeddingModel(model, ModelCallScene.KNOWLEDGE_INDEX);
     }
 
+    /**
+     * 按供应商创建流式聊天模型实例（仅缓存未命中时调用），
+     * 统一注入监控监听器，再按 provider 路由到各供应商专属构建方法，
+     * 由它们处理 SDK 间参数命名、端点处理等差异。
+     */
     private StreamingChatModel createStreamingChatModel(AigcModel model, AgentModelConfig config, String scene) {
         AiProviderType provider = AiProviderType.fromCode(model.getProvider());
         log.info("构建流式聊天模型，modelId={}, provider={}, model={}, scene={}",
                 model.getId(), provider, model.getModel(), scene);
+        // 注入模型调用监听器，使本次对话的 token 消耗与耗时可被监控模块采集
         List<ChatModelListener> listeners = List.of(modelCallListenerFactory.createChatListener(metadataOf(model, scene)));
+        // 按供应商路由：OpenAI 系走通用兼容实现，其余供应商各有独立构建方法
         return switch (provider) {
             case OPENAI, DEEPSEEK, OPENAI_COMPATIBLE -> openAiCompatibleStreamingModel(model, config, listeners);
             case OLLAMA -> ollamaStreamingModel(model, config, listeners);
@@ -118,6 +129,10 @@ public class LangChain4jModelFactory {
         };
     }
 
+    /**
+     * 按供应商创建向量模型实例（仅缓存未命中时调用）：注入监控监听器后按 provider 路由；
+     * DashScope / 智谱构建器不支持 listeners，统一在创建后用 addListener 补齐。
+     */
     private EmbeddingModel createEmbeddingModel(AigcModel model, String scene) {
         AiProviderType provider = AiProviderType.fromCode(model.getProvider());
         log.info("构建向量模型，modelId={}, provider={}, model={}, scene={}",
@@ -136,10 +151,15 @@ public class LangChain4jModelFactory {
         return embeddingModel.addListener(listener);
     }
 
+    /** 组装模型调用元数据（模型 id/名称/供应商/场景），供监控监听器按维度上报。 */
     private ModelCallMetadata metadataOf(AigcModel model, String scene) {
         return ModelCallMetadata.of(model.getId(), model.getModel(), model.getProvider(), scene);
     }
 
+    /**
+     * 构建 OpenAI 兼容流式模型，统一覆盖 OpenAI / DeepSeek / 自定义 OpenAI 兼容服务，
+     * 均走标准 OpenAI Chat Completions 协议。
+     */
     private StreamingChatModel openAiCompatibleStreamingModel(
             AigcModel model, AgentModelConfig config, List<ChatModelListener> listeners) {
         OpenAiStreamingChatModel.OpenAiStreamingChatModelBuilder builder = OpenAiStreamingChatModel.builder()
@@ -154,12 +174,17 @@ public class LangChain4jModelFactory {
         return builder.build();
     }
 
+    /**
+     * 构建 Ollama 流式模型（本地或私化部署，无需 API Key）。
+     * 注意 Ollama 的最大生成长度参数名为 numPredict，对应 OpenAI 的 maxTokens。
+     */
     private StreamingChatModel ollamaStreamingModel(
             AigcModel model, AgentModelConfig config, List<ChatModelListener> listeners) {
         OllamaStreamingChatModel.OllamaStreamingChatModelBuilder builder = OllamaStreamingChatModel.builder()
                 .modelName(model.getModel())
                 .temperature(temperature(config, model))
                 .topP(topP(config, model))
+                // numPredict 即最大生成长度（Ollama 命名与 OpenAI 的 maxTokens 不同）
                 .numPredict(maxTokens(config, model))
                 .timeout(timeout(model))
                 .listeners(listeners);
@@ -167,11 +192,16 @@ public class LangChain4jModelFactory {
         return builder.build();
     }
 
+    /**
+     * 构建 DashScope（通义千问）原生流式模型：温度参数需转 Float 适配 SDK，
+     * 端点用专用过滤逻辑（见 applyDashScopeBaseUrl），不能透传 OpenAI 兼容地址。
+     */
     private StreamingChatModel dashScopeStreamingModel(
             AigcModel model, AgentModelConfig config, List<ChatModelListener> listeners) {
         QwenStreamingChatModel.QwenStreamingChatModelBuilder builder = QwenStreamingChatModel.builder()
                 .modelName(model.getModel())
                 .apiKey(defaultApiKey(model))
+                // Qwen SDK 的温度参数类型为 Float 而非 Double
                 .temperature(toFloat(temperature(config, model)))
                 .topP(topP(config, model))
                 .maxTokens(maxTokens(config, model))
@@ -181,6 +211,10 @@ public class LangChain4jModelFactory {
         return builder.build();
     }
 
+    /**
+     * 构建 OpenAI 兼容向量模型，覆盖 OpenAI / DeepSeek / 自定义 OpenAI 兼容服务，
+     * 走标准 OpenAI Embeddings 协议。
+     */
     private EmbeddingModel openAiCompatibleEmbeddingModel(AigcModel model, List<EmbeddingModelListener> listeners) {
         OpenAiEmbeddingModel.OpenAiEmbeddingModelBuilder builder = OpenAiEmbeddingModel.builder()
                 .modelName(model.getModel())
@@ -192,6 +226,7 @@ public class LangChain4jModelFactory {
         return builder.build();
     }
 
+    /** 构建 Ollama 向量模型（本地部署，无需 API Key）。 */
     private EmbeddingModel ollamaEmbeddingModel(AigcModel model, List<EmbeddingModelListener> listeners) {
         OllamaEmbeddingModel.OllamaEmbeddingModelBuilder builder = OllamaEmbeddingModel.builder()
                 .modelName(model.getModel())
@@ -201,6 +236,9 @@ public class LangChain4jModelFactory {
         return builder.build();
     }
 
+    /**
+     * 构建 DashScope 向量模型：需指定向量维度；端点过滤兼容地址避免原生 SDK 404。
+     */
     private EmbeddingModel dashScopeEmbeddingModel(AigcModel model) {
         QwenEmbeddingModel.QwenEmbeddingModelBuilder builder = QwenEmbeddingModel.builder()
                 .modelName(model.getModel())
@@ -211,6 +249,10 @@ public class LangChain4jModelFactory {
         return builder.build();
     }
 
+    /**
+     * 构建智谱（GLM）流式模型；注意模型名参数为 model 而非 modelName，
+     * 最大生成长度参数名为 maxToken（无 s）。
+     */
     private StreamingChatModel zhipuStreamingModel(
             AigcModel model, AgentModelConfig config, List<ChatModelListener> listeners) {
         ZhipuAiStreamingChatModel.ZhipuAiStreamingChatModelBuilder builder =
@@ -219,12 +261,14 @@ public class LangChain4jModelFactory {
                         .apiKey(defaultApiKey(model))
                         .temperature(temperature(config, model))
                         .topP(topP(config, model))
+                        // 智谱 SDK 的生成长度参数名为 maxToken，与 OpenAI 的 maxTokens 命名不同
                         .maxToken(maxTokens(config, model))
                         .listeners(listeners);
         applyBaseUrl(model, builder::baseUrl);
         return builder.build();
     }
 
+    /** 构建智谱向量模型；智谱构建器不提供 listeners(...)，由调用方 addListener 补齐。 */
     private EmbeddingModel zhipuEmbeddingModel(AigcModel model) {
         ZhipuAiEmbeddingModel.ZhipuAiEmbeddingModelBuilder builder = ZhipuAiEmbeddingModel.builder()
                 .model(model.getModel())
@@ -233,6 +277,10 @@ public class LangChain4jModelFactory {
         return builder.build();
     }
 
+    /**
+     * 构建 Google Gemini 流式模型；端点固定官方地址，不支持自定义 baseUrl，
+     * 生成长度参数名为 maxOutputTokens。
+     */
     private StreamingChatModel geminiStreamingModel(
             AigcModel model, AgentModelConfig config, List<ChatModelListener> listeners) {
         return GoogleAiGeminiStreamingChatModel.builder()
@@ -245,6 +293,7 @@ public class LangChain4jModelFactory {
                 .build();
     }
 
+    /** 构建 Google Gemini 向量模型；端点固定官方地址，不支持自定义 baseUrl。 */
     private EmbeddingModel geminiEmbeddingModel(AigcModel model, List<EmbeddingModelListener> listeners) {
         return GoogleAiEmbeddingModel.builder()
                 .apiKey(defaultApiKey(model))
@@ -253,11 +302,16 @@ public class LangChain4jModelFactory {
                 .build();
     }
 
+    /** 解析请求超时时间；未配置或非正值时默认 3 分钟。 */
     private Duration timeout(AigcModel model) {
         int minutes = model.getTimeout() == null || model.getTimeout() <= 0 ? 3 : model.getTimeout();
         return Duration.ofMinutes(minutes);
     }
 
+    /**
+     * 解析向量维度，必须配置为正整数，否则抛出业务异常——
+     * 向量库建表（集合）依赖维度，与实际模型维度不一致会导致写入失败。
+     */
     private Integer embeddingDimension(AigcModel model) {
         Integer dimension = ModelConfigSupport.resolveDimension(model);
         if (dimension == null) {
@@ -269,18 +323,25 @@ public class LangChain4jModelFactory {
         return dimension;
     }
 
+    /** 最大生成长度：优先 Agent 级覆盖，未覆盖则沿用模型库配置。 */
     private Integer maxTokens(AgentModelConfig config, AigcModel model) {
         return firstNonNull(config.maxOutputTokens(), model.getMaxToken());
     }
 
+    /** 采样温度：Agent 级覆盖 → 模型库配置 → 默认 0.7。 */
     private Double temperature(AgentModelConfig config, AigcModel model) {
         return firstNonNull(config.temperature(), model.getTemperature(), 0.7D);
     }
 
+    /** 核采样概率：Agent 级覆盖 → 模型库配置 → 默认 0.9。 */
     private Double topP(AgentModelConfig config, AigcModel model) {
         return firstNonNull(config.topP(), model.getTopP(), 0.9D);
     }
 
+    /**
+     * 解析 Agent 的模型配置 JSON；为空或解析失败时回退空配置（空配置内各参数为 null，
+     * 由 temperature/topP/maxTokens 的默认值兜底）。
+     */
     private AgentModelConfig parseAgentModelConfig(AigcAgent agent) {
         if (agent == null || StrUtil.isBlank(agent.getModelConfigJson())) {
             return AgentModelConfig.empty();
@@ -293,10 +354,15 @@ public class LangChain4jModelFactory {
         }
     }
 
+    /** 未配置 API Key 时返回占位值，避免部分构建器对空 Key 的校验报错（本地模型无需真实凭证）。 */
     private String defaultApiKey(AigcModel model) {
         return StrUtil.isBlank(model.getApiKey()) ? EMPTY_API_KEY : model.getApiKey();
     }
 
+    /**
+     * 将模型库的 baseUrl 透传给构建器：可指向 DeepSeek、OpenAI 兼容网关或任意私化服务；
+     * 为空时由各 SDK 使用自己的默认端点。
+     */
     private void applyBaseUrl(AigcModel model, java.util.function.Consumer<String> consumer) {
         consumer.accept(model.getBaseUrl());
     }
@@ -329,6 +395,7 @@ public class LangChain4jModelFactory {
         }
     }
 
+    /** 优先级链：返回第一个非空值，用于「Agent 覆盖 → 模型库默认 → 内置兜底」三级取值。 */
     @SafeVarargs
     private <T> T firstNonNull(T... values) {
         for (T value : values) {
@@ -339,15 +406,18 @@ public class LangChain4jModelFactory {
         return null;
     }
 
+    /** 适配 DashScope（Qwen）SDK：温度参数类型为 Float。 */
     private Float toFloat(Double value) {
         return value == null ? null : value.floatValue();
     }
 
+    /** Agent 级模型参数覆盖项（解析自 modelConfigJson），null 表示不覆盖、沿用模型库配置。 */
     private record AgentModelConfig(
             Double temperature,
             Double topP,
             Integer maxOutputTokens
     ) {
+        /** 全 null 的空配置，等价于完全沿用模型库默认值。 */
         private static AgentModelConfig empty() {
             return new AgentModelConfig(null, null, null);
         }

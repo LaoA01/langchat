@@ -11,6 +11,7 @@ public final class KnowledgeIndexExecutorNames {
     /** 文档向量化异步线程池。 */
     public static final String DOCUMENT_INDEX_TASK_EXECUTOR = "documentIndexTaskExecutor";
 
+    /** 私有构造：常量类，禁止实例化。 */
     private KnowledgeIndexExecutorNames() {
     }
 }

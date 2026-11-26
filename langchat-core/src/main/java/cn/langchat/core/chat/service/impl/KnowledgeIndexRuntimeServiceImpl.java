@@ -60,16 +60,27 @@ public class KnowledgeIndexRuntimeServiceImpl implements KnowledgeIndexRuntimeSe
     private final KnowledgeIndexAsyncService knowledgeIndexAsyncService;
     private final ObjectMapper objectMapper;
 
+    /**
+     * 提交知识库索引任务：将待索引文档逐个交给异步线程池向量化，
+     * 本方法只负责「圈定文档 + 重置状态 + 派发任务」并立即返回，
+     * 实际的解析、切片、向量化在后台完成，前端通过 queryIndexStatus 轮询进度。
+     */
     @Override
     public KnowledgeIndexResult indexKnowledge(String knowledgeId, KnowledgeIndexRequest request) {
+        // 1. 校验知识库存在，不存在直接报错（避免对孤儿文档派发无效任务）
         AigcKnowledge knowledge = aigcKnowledgeService.getById(knowledgeId);
         if (knowledge == null) {
             throw new BizException(CoreErrorCode.KNOWLEDGE_NOT_FOUND);
         }
+        // 2. 加载待索引文档（按请求 docsIds 圈定，排除已停用文档）
         List<AigcDocs> docsList = loadDocs(knowledgeId, request);
+        // 3. 逐个文档派发：解析切片参数 → 重置为排队状态 → 提交异步索引任务
         for (AigcDocs docs : docsList) {
+            // 3.1 解析切片配置：优先请求参数，其次文档 ingestionConfig，最终回退处理器默认
             DocumentSplitConfig splitConfig = resolveSplitConfig(docs, request.getChunkSize(), request.getOverlapSize());
+            // 3.2 将文档状态重置为 PENDING，清空历史失败/完成痕迹，避免状态查询误判
             markDocsQueued(docs);
+            // 3.3 提交到异步线程池（本调用立即返回，不阻塞），由处理器完成解析→切片→向量化→入库
             knowledgeIndexAsyncService.submitDocumentIndex(
                     knowledgeId,
                     docs.getId(),
@@ -85,6 +96,8 @@ public class KnowledgeIndexRuntimeServiceImpl implements KnowledgeIndexRuntimeSe
             );
         }
 
+        // 4. 汇总返回：因任务异步执行，此处 segmentCount/embeddedCount 恒为 0，
+        //    真实进度需调用 queryIndexStatus 获取
         KnowledgeIndexResult result = new KnowledgeIndexResult();
         result.setKnowledgeId(knowledgeId);
         result.setDocsCount(docsList.size());
@@ -159,10 +172,19 @@ public class KnowledgeIndexRuntimeServiceImpl implements KnowledgeIndexRuntimeSe
         return result;
     }
 
+    /**
+     * 加载知识库下待索引的文档列表。
+     *
+     * <p>过滤规则：只取启用（enabled=true 或未被显式停用）的文档；
+     * 若请求指定了 docsIds 则进一步按 ID 圈定，未指定则返回全部启用文档。
+     * 按更新时间倒序排列，最新修改的文档优先索引。列表可能为空，不视为异常。</p>
+     */
     private List<AigcDocs> loadDocs(String knowledgeId, KnowledgeIndexRequest request) {
         return aigcDocsService.lambdaQuery()
                 .eq(AigcDocs::getKnowledgeId, knowledgeId)
+                // 仅取启用文档：enabled=true 或字段为 null（历史数据未显式停用）
                 .and(query -> query.eq(AigcDocs::getEnabled, Boolean.TRUE).or().isNull(AigcDocs::getEnabled))
+                // 可选圈定：请求带 docsIds 时过滤，条件表达式在 docsIds 为空时不拼入 SQL
                 .in(request.getDocsIds() != null && !request.getDocsIds().isEmpty(), AigcDocs::getId, request.getDocsIds())
                 .orderByDesc(AigcDocs::getUpdateTime)
                 .list();
@@ -212,25 +234,37 @@ public class KnowledgeIndexRuntimeServiceImpl implements KnowledgeIndexRuntimeSe
         return indexRequest;
     }
 
+    /**
+     * 解析文档切片配置，优先级三级递进：
+     * 请求参数 → 文档 ingestionConfig（同时兼容 camelCase 与 snake_case 键名）→ 留空由处理器用内置默认。
+     *
+     * <p>注意：chunkSize 与 overlapSize 各自独立回退，可能一个来自请求、一个来自文档配置；
+     * 两者均为 null 时处理器按默认切片策略执行。</p>
+     */
     private DocumentSplitConfig resolveSplitConfig(AigcDocs docs, Integer requestChunkSize, Integer requestOverlapSize) {
         Integer chunkSize = requestChunkSize;
         Integer overlapSize = requestOverlapSize;
+        // 快路径：请求参数两项都给了，直接使用，无需解析文档配置
         if (chunkSize != null && overlapSize != null) {
             return new DocumentSplitConfig(chunkSize, overlapSize);
         }
+        // 解析文档级 ingestionConfig（解析失败返回空 Map，不阻断流程）
         Map<String, Object> ingestionConfig = parseIngestionConfig(docs);
         if (chunkSize == null) {
+            // 兼容 chunkSize 与 chunk_size 两种键名写法
             chunkSize = integerValue(
                     ingestionConfig.get(CONFIG_CHUNK_SIZE),
                     ingestionConfig.get(CONFIG_CHUNK_SIZE_ALT)
             );
         }
         if (overlapSize == null) {
+            // 兼容 overlapSize 与 overlap_size 两种键名写法
             overlapSize = integerValue(
                     ingestionConfig.get(CONFIG_OVERLAP_SIZE),
                     ingestionConfig.get(CONFIG_OVERLAP_SIZE_ALT)
             );
         }
+        // 可能为 null/null 或部分 null，null 项交由处理器按默认值处理
         return new DocumentSplitConfig(chunkSize, overlapSize);
     }
 
@@ -276,14 +310,24 @@ public class KnowledgeIndexRuntimeServiceImpl implements KnowledgeIndexRuntimeSe
         return values.stream().limit(limit).toList();
     }
 
+    /**
+     * 将文档标记为「排队中」并清空历史状态，确保重复索引/重试从干净起点开始。
+     *
+     * <p>关键点：同时重置索引状态（indexingStatus，DB 整数状态）与向量化状态
+     * （embedStatus，字符串编码），并清空错误信息与开始/结束时间——
+     * 否则上一次的失败痕迹会在重新排队时被误报给前端。
+     * 内存对象与数据库双写，保证同事务内后续读取一致。</p>
+     */
     private void markDocsQueued(AigcDocs docs) {
         long now = System.currentTimeMillis();
+        // 原地更新内存对象，避免外层循环再取一次库
         docs.setIndexingStatus(DocumentIndexStatusEnum.PENDING.dbStatus());
         docs.setEmbedStatus(DocumentIndexStatusEnum.PENDING.code());
         docs.setEmbedError(null);
         docs.setEmbedStartTime(null);
         docs.setEmbedEndTime(null);
         docs.setUpdateTime(now);
+        // 持久化到 DB，前端轮询 queryIndexStatus 时立即看到「排队中」
         aigcDocsService.lambdaUpdate()
                 .eq(AigcDocs::getId, docs.getId())
                 .set(AigcDocs::getIndexingStatus, DocumentIndexStatusEnum.PENDING.dbStatus())

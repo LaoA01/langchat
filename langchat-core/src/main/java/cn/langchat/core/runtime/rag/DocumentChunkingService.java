@@ -41,6 +41,9 @@ public class DocumentChunkingService {
         return segments;
     }
 
+    /**
+     * 规范化文本：统一换行符为 \n，压缩 3 个及以上连续换行为 2 个，并去除首尾空白。
+     */
     private String normalize(String content) {
         if (content == null) {
             return "";

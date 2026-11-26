@@ -45,8 +45,11 @@ import org.springframework.util.StringUtils;
 @RequiredArgsConstructor
 public class SkillPackageServiceImpl implements SkillPackageService {
 
+    /** 技能包默认入口主文档名。 */
     private static final String ENTRY_FILE = "SKILL.md";
+    /** 工作区本地路径前缀。 */
     private static final String WORKSPACE_PREFIX = "skills/";
+    /** 技能包上传/下载大小上限（500MB）。 */
     private static final long MAX_PACKAGE_SIZE = 500L * 1024 * 1024;
     private static final List<String> TEXT_EXTENSIONS = List.of(
             "md", "markdown", "txt", "json", "yaml", "yml", "xml", "html", "htm", "css",
@@ -180,13 +183,27 @@ public class SkillPackageServiceImpl implements SkillPackageService {
         return skill;
     }
 
+    /**
+     * 读取技能包内的文档内容：
+     * path 为空读入口主文档（默认 SKILL.md），传目录返回文件清单，传文件返回正文；
+     * 主文档会剥离 frontmatter，非主文档原样返回，二进制文件返回占位提示。
+     *
+     * @param skill 技能实体
+     * @param path  技能包内相对路径，null/空表示读主文档
+     * @return 文档文本内容，或目录清单/二进制占位提示
+     */
     @Override
     public String readSkillDocument(AigcSkill skill, String path) {
+        // 确保本地工作区就绪，缺失时自动从 OSS 回源释放
         ensureWorkspace(skill);
+        // 入口文件名取技能配置，缺省为 SKILL.md
         String entryFile = StringUtils.hasText(skill.getEntryFile()) ? skill.getEntryFile() : ENTRY_FILE;
+        // path 为空时回退入口主文档，否则按调用方指定的相对路径读取
         String relativePath = StringUtils.hasText(path) ? path.trim() : entryFile;
+        // 解析为工作区内绝对路径并做防穿越校验（阻止 .. 逃逸）
         Path target = resolveSecurePath(skill, relativePath);
         try {
+            // 目标是目录：列出其中内容（子目录加 / 后缀），拼成清单文本返回
             if (Files.isDirectory(target)) {
                 List<String> children = new ArrayList<>();
                 try (Stream<Path> stream = Files.list(target)) {
@@ -195,18 +212,22 @@ public class SkillPackageServiceImpl implements SkillPackageService {
                 }
                 return "目录 " + relativePath + " 下的文件：\n" + String.join("\n", children);
             }
+            // 文件不存在则报错，提示具体路径便于排查
             if (!Files.exists(target)) {
                 throw new BizException("SKILL_FILE_NOT_FOUND", "技能文件不存在：" + relativePath);
             }
+            // 二进制文件不返回正文，避免模型收到乱码
             if (isBinaryFile(target)) {
                 return "[二进制文件，无法以文本形式展示：" + relativePath + "]";
             }
+            // 读取文本内容；主文档额外剥离 frontmatter（name/description 等元数据不进模型上下文）
             String content = Files.readString(target, StandardCharsets.UTF_8);
             if (entryFile.equalsIgnoreCase(relativePath)) {
                 return SkillFrontmatter.stripFrontmatter(content);
             }
             return content;
         } catch (IOException exception) {
+            // 读取过程中的 IO 异常统一包装为业务异常抛出
             throw new BizException("SKILL_WORKSPACE_ERROR", "读取技能文档失败：" + exception.getMessage());
         }
     }
@@ -231,9 +252,11 @@ public class SkillPackageServiceImpl implements SkillPackageService {
      * 确保本地工作区存在，缺失时从 OSS 回源释放。
      */
     private void ensureWorkspace(AigcSkill skill) {
+        // 本地路径缺失直接视为工作区不可用
         if (!StringUtils.hasText(skill.getLocalPath())) {
             throw new BizException("SKILL_WORKSPACE_MISSING", "技能缺少本地工作区路径");
         }
+        // 工作区目录存在且非空即就绪，直接返回
         Path dir = skillDir(skill.getLocalPath());
         if (Files.isDirectory(dir)) {
             try (Stream<Path> stream = Files.list(dir)) {
@@ -244,11 +267,14 @@ public class SkillPackageServiceImpl implements SkillPackageService {
                 log.warn("检查技能工作区失败，skillId={}", skill.getId(), exception);
             }
         }
+        // 无本地目录且无 OSS 备份，无法恢复
         if (!StringUtils.hasText(skill.getOssObjectKey())) {
             throw new BizException("SKILL_OSS_MISSING", "本地技能包已丢失且没有 OSS 备份可回源");
         }
+        // 从 OSS 下载技能包压缩包并解压为条目映射
         byte[] zipBytes = ossService.download(skill.getOssObjectKey());
         Map<String, byte[]> entries = unzip(zipBytes);
+        // 定位包内技能根目录后，将内容物化到本地工作区
         String base = locateSkillRoot(entries);
         materializeWorkspace(skill.getLocalPath(), entries, base);
         log.info("本地技能包缺失，已从 OSS 回源，skillId={}", skill.getId());
@@ -279,8 +305,14 @@ public class SkillPackageServiceImpl implements SkillPackageService {
         }
     }
 
+    /**
+     * 将技能的本地相对路径转换为工作区下的绝对目录，并做防穿越校验
+     * （解析结果必须仍在工作区根目录内）。
+     */
     private Path skillDir(String localPath) {
+        // 工作区根目录（配置项 workspaceDir）的绝对路径
         Path root = Paths.get(skillProperties.getWorkspaceDir()).toAbsolutePath().normalize();
+        // 解析技能目录，超出工作区根目录即非法
         Path dir = root.resolve(localPath).normalize();
         if (!dir.startsWith(root)) {
             throw new BizException("SKILL_PATH_INVALID", "非法的技能工作区路径");
@@ -293,10 +325,17 @@ public class SkillPackageServiceImpl implements SkillPackageService {
         return skillDir(skill.getLocalPath());
     }
 
+    /**
+     * 将技能包内相对路径解析为工作区内绝对路径，并做防目录穿越校验：
+     * path 为空或根 "/" 时直接返回技能根目录；解析结果必须仍在技能目录内，
+     * 否则视为非法路径（阻止 ../ 逃逸访问工作区外文件）。
+     */
     private Path resolveSecurePath(AigcSkill skill, String path) {
+        // 空路径或根路径直接返回技能根目录
         if (!StringUtils.hasText(path) || "/".equals(path.trim())) {
             return skillDir(skill.getLocalPath());
         }
+        // 从技能根目录解析目标并规范化，必须仍在技能目录内才合法
         Path dir = skillDir(skill.getLocalPath());
         Path target = dir.resolve(path.trim()).normalize();
         if (!target.startsWith(dir)) {
@@ -435,20 +474,28 @@ public class SkillPackageServiceImpl implements SkillPackageService {
         return String.join(",", merged);
     }
 
+    /**
+     * 判断文件是否为二进制：扩展名不在文本扩展名白名单中直接判定为二进制；
+     * 无扩展名或扩展名在白名单中时再按内容探测（含 NUL 字符视为二进制）。
+     */
     private boolean isBinaryFile(Path target) {
+        // 先按扩展名快速判定，已知文本类型不进内容探测
         String filename = target.getFileName().toString().toLowerCase();
         int dot = filename.lastIndexOf('.');
         if (dot >= 0) {
             String ext = filename.substring(dot + 1);
+            // 扩展名不在文本白名单，直接判定为二进制
             if (!TEXT_EXTENSIONS.contains(ext)) {
                 return true;
             }
         }
         try {
+            // 内容探测：读取全量字节，按 UTF-8 解码后出现 NUL 字符视为二进制
             byte[] head = Files.readAllBytes(target);
             String decoded = new String(head, StandardCharsets.UTF_8);
             return decoded.contains("\u0000");
         } catch (IOException exception) {
+            // 读取失败按二进制处理，避免误返回不可读内容
             return true;
         }
     }

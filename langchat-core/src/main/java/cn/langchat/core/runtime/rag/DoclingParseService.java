@@ -73,6 +73,9 @@ public class DoclingParseService {
         }
     }
 
+    /**
+     * 构建 Docling 解析器：按配置的服务地址与超时创建 docling-serve 客户端。
+     */
     private DoclingDocumentParser buildParser() {
         Duration timeout = Duration.ofSeconds(resolveTimeoutSeconds());
         DoclingServeApi client = DoclingServeApi.builder()
@@ -85,6 +88,9 @@ public class DoclingParseService {
                 .build();
     }
 
+    /**
+     * 解析超时秒数：未配置或非正值时回退默认 300 秒，避免外部服务挂起阻塞线程。
+     */
     private int resolveTimeoutSeconds() {
         Integer timeout = doclingParseProperties.getTimeoutSeconds();
         return timeout == null || timeout <= 0 ? 300 : timeout;

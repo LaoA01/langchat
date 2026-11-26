@@ -36,6 +36,10 @@ public class VectorStoreFactory {
         return vectorStoreCache.computeIfAbsent(cacheKey, key -> createStore(vectorStore));
     }
 
+    /**
+     * 按向量库供应商类型创建 EmbeddingStore 实例：
+     * PGVECTOR 走 pgvector、MILVUS 走 Milvus，创建前统一校验表名与向量维度配置。
+     */
     private EmbeddingStore<TextSegment> createStore(AigcVectorStore vectorStore) {
         VectorStoreProviderEnum provider = VectorStoreProviderEnum.fromCode(vectorStore.getProvider());
         log.info("构建向量库实例，vectorStoreId={}, provider={}", vectorStore.getId(), provider);

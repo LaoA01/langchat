@@ -43,8 +43,10 @@ import org.springframework.stereotype.Component;
 @Slf4j
 public class DocumentContentParseService {
 
+    /** QA 文档 JSON 数组格式的反序列化类型。 */
     private static final TypeReference<List<Map<String, Object>>> QA_LIST_TYPE = new TypeReference<>() {
     };
+    /** 通用 JSON 对象的反序列化类型（QA 包装对象 / ingestionConfig）。 */
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {
     };
     private static final String QA_QUESTION_KEY = "question";
@@ -122,18 +124,27 @@ public class DocumentContentParseService {
         }
     }
 
+    /**
+     * 解析 QA 类型知识文档：将问题-答案对逐一组装成分段文本。
+     */
     private ParsedDocumentContent parseQaDocument(AigcDocs docs) {
         String rawContent = resolveRawContent(docs);
         List<String> sections = parseQaSections(rawContent);
         return buildResult(docs, sections, PARSER_QA);
     }
 
+    /**
+     * 解析纯文本 / Markdown 文档：整篇内容规范后作为单个分段，并按类型标记解析器来源。
+     */
     private ParsedDocumentContent parsePlainTextDocument(AigcDocs docs, KnowledgeDocumentTypeEnum documentType) {
         String rawContent = resolveRawContent(docs);
         List<String> sections = List.of(normalizeText(rawContent));
         return buildResult(docs, sections, documentType == KnowledgeDocumentTypeEnum.MARKDOWN ? PARSER_MARKDOWN : PARSER_TEXT);
     }
 
+    /**
+     * 解析文件型文档：优先复用已存储的正文；正文缺失时从 OSS 文件按解析模式提取文本。
+     */
     private ParsedDocumentContent parseFileDocument(AigcDocs docs) {
         String rawContent = resolveRawContent(docs);
         if (rawContent != null && !rawContent.isBlank()) {
@@ -144,6 +155,9 @@ public class DocumentContentParseService {
         return buildResult(docs, List.of(normalizeText(parsedFileContent.content())), parsedFileContent.parserName());
     }
 
+    /**
+     * 组装解析结果：各分段规范化并过滤空段，顺序拼接为纯文本全文供索引与展示。
+     */
     private ParsedDocumentContent buildResult(AigcDocs docs, List<String> sections, String parserName) {
         List<String> normalizedSections = sections.stream()
                 .map(this::normalizeText)
@@ -158,6 +172,9 @@ public class DocumentContentParseService {
         return result;
     }
 
+    /**
+     * 解析文档内联正文：优先 content 字段，其次 url、pdfUrl 中以 data: URI 存储的正文。
+     */
     private String resolveRawContent(AigcDocs docs) {
         if (docs.getContent() != null && !docs.getContent().isBlank()) {
             return decodeDataUriIfNecessary(docs.getContent());
@@ -171,6 +188,9 @@ public class DocumentContentParseService {
         return "";
     }
 
+    /**
+     * 判定文档类型：优先业务标注的 type 字段，未标注时按文件扩展名推断。
+     */
     private KnowledgeDocumentTypeEnum resolveDocumentType(AigcDocs docs) {
         KnowledgeDocumentTypeEnum type = KnowledgeDocumentTypeEnum.fromCode(docs.getType());
         if (type != KnowledgeDocumentTypeEnum.UNKNOWN) {
@@ -185,6 +205,9 @@ public class DocumentContentParseService {
         };
     }
 
+    /**
+     * 解析 QA 分段：优先尝试 JSON 格式（数组或包装对象），未命中再按逐行文本格式解析。
+     */
     private List<String> parseQaSections(String rawContent) {
         if (rawContent == null || rawContent.isBlank()) {
             return List.of();
@@ -196,6 +219,9 @@ public class DocumentContentParseService {
         return parseQaLines(rawContent);
     }
 
+    /**
+     * 解析 JSON 格式的 QA 数据：先按 [{...}] 数组读取，失败再按 {items|data|list} 包装对象提取行。
+     */
     private List<String> parseQaJson(String rawContent) {
         try {
             List<Map<String, Object>> rows = objectMapper.readValue(rawContent, QA_LIST_TYPE);
@@ -222,6 +248,9 @@ public class DocumentContentParseService {
         }
     }
 
+    /**
+     * 逐行解析 QA 文本：识别问题前缀（Q:/问题:/问:）与答案前缀（A:/答案:/答:）并两两配对组装。
+     */
     private List<String> parseQaLines(String rawContent) {
         List<String> sections = new ArrayList<>();
         String[] lines = normalizeText(rawContent).split("\n");
@@ -254,6 +283,10 @@ public class DocumentContentParseService {
         return sections.isEmpty() ? List.of(normalizeText(rawContent)) : sections;
     }
 
+    /**
+     * 将 QA 数据行转换为「问题：xxx
+答案：xxx」分段文本，兼容 question/q/title/ask 与答案的多键名。
+     */
     private List<String> buildQaSections(List<Map<String, Object>> rows) {
         List<String> sections = new ArrayList<>();
         for (Map<String, Object> row : rows) {
@@ -276,6 +309,10 @@ public class DocumentContentParseService {
         return sections;
     }
 
+    /**
+     * 解析文件型文档文本：按文档解析模式（BUILTIN/DOCLING/AUTO）与文件类型选择解析器，
+     * 先确定文件来源再按类型分发到 Docling / PDFBox / Tika / 纯文本读取。
+     */
     private ParsedFileContent parseFileText(AigcDocs docs, AigcOss oss) {
         String source = resolveFileSource(docs, oss);
         KnowledgeFileTypeEnum fileType = KnowledgeFileTypeEnum.fromExtension(firstNonBlank(docs.getExt(), oss == null ? null : oss.getExt()));
@@ -354,12 +391,18 @@ public class DocumentContentParseService {
         }
     }
 
+    /**
+     * 使用 Tika 通用解析器提取文件文本（可处理 Word/Excel/PPT 等格式）。
+     */
     private String parseWithTika(String source) throws Exception {
         try (InputStream inputStream = openSourceStream(source)) {
             return tika.parseToString(inputStream);
         }
     }
 
+    /**
+     * 解析 PDF：优先 Tika，Tika 抛异常时回退 PDFBox 的 PDFTextStripper 提取文本。
+     */
     private ParsedFileContent parsePdf(String source) throws Exception {
         try {
             return new ParsedFileContent(parseWithTika(source), PARSER_TIKA);
@@ -370,12 +413,14 @@ public class DocumentContentParseService {
         }
     }
 
+    /** 读取纯文本文件的完整字节并按 UTF-8 解码为字符串。 */
     private String parsePlainTextFile(String source) throws Exception {
         try (InputStream inputStream = openSourceStream(source)) {
             return new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
         }
     }
 
+    /** 按文档关联的 ossId 加载 OSS 记录；未关联时返回 null。 */
     private AigcOss loadOss(AigcDocs docs) {
         if (docs.getOssId() == null || docs.getOssId().isBlank()) {
             return null;
@@ -383,6 +428,9 @@ public class DocumentContentParseService {
         return aigcOssService.getById(docs.getOssId());
     }
 
+    /**
+     * 确定文档解析来源：优先 OSS 路径 / URL，其次文档 url / pdfUrl；全部缺失时抛出业务异常。
+     */
     private String resolveFileSource(AigcDocs docs, AigcOss oss) {
         String source = firstNonBlank(
                 oss == null ? null : oss.getPath(),
@@ -396,30 +444,39 @@ public class DocumentContentParseService {
         return source;
     }
 
+    /** 输出规范化的「问题：xxx
+答案：xxx」文本。 */
     private String formatQa(String question, String answer) {
         return "问题：" + normalizeText(question) + "\n答案：" + normalizeText(answer);
     }
 
+    /** 去除问题行的常见前缀（Q:、问题:、问: 及其全角变体）。 */
     private String trimQaPrefix(String value) {
         return value.replaceFirst("^(Q:|Q：|问题:|问题：|问:|问：)", "").trim();
     }
 
+    /** 去除答案行的常见前缀（A:、答案:、答: 及其全角变体）。 */
     private String trimAaPrefix(String value) {
         return value.replaceFirst("^(A:|A：|答案:|答案：|答:|答：)", "").trim();
     }
 
+    /** 判断该行是否以问题前缀开始（Q:、问题:、问: 及其全角变体）。 */
     private boolean isQuestionLine(String value) {
         return value.startsWith("Q:") || value.startsWith("Q：")
                 || value.startsWith("问题:") || value.startsWith("问题：")
                 || value.startsWith("问:") || value.startsWith("问：");
     }
 
+    /** 判断该行是否以答案前缀开始（A:、答案:、答: 及其全角变体）。 */
     private boolean isAnswerLine(String value) {
         return value.startsWith("A:") || value.startsWith("A：")
                 || value.startsWith("答案:") || value.startsWith("答案：")
                 || value.startsWith("答:") || value.startsWith("答：");
     }
 
+    /**
+     * data: URI 解码：base64 或 URL 编码的正文还原为明文；非 data: URI 则原样返回。
+     */
     private String decodeDataUriIfNecessary(String value) {
         if (value == null || !value.startsWith(DATA_URI_PREFIX)) {
             return value;
@@ -436,6 +493,10 @@ public class DocumentContentParseService {
         return URLDecoder.decode(payload, StandardCharsets.UTF_8);
     }
 
+    /**
+     * 按来源协议打开输入流：s3:// 走 OSS 下载、file:/http(s):// 走本地文件或网络路径，
+     * 其余按普通文件路径读取。
+     */
     private InputStream openSourceStream(String source) throws Exception {
         if (source.startsWith("s3://")) {
             URI uri = URI.create(source);
@@ -454,6 +515,9 @@ public class DocumentContentParseService {
         return Files.newInputStream(Path.of(source));
     }
 
+    /**
+     * 加载 PDF 为 PDFBox 文档对象，兼容 file:/http(s):// URI 与普通文件路径。
+     */
     private PDDocument loadPdfDocument(String source) throws Exception {
         if (source.startsWith(FILE_URI_SCHEME)) {
             return Loader.loadPDF(Path.of(URI.create(source)).toFile());
@@ -472,6 +536,9 @@ public class DocumentContentParseService {
         }
     }
 
+    /**
+     * 规范化文本：统一换行符为 \n，压缩 3 个及以上连续换行为 2 个，并去除首尾空白。
+     */
     private String normalizeText(String content) {
         if (content == null) {
             return "";
@@ -482,10 +549,12 @@ public class DocumentContentParseService {
                 .trim();
     }
 
+    /** null 安全的字符串转换。 */
     private String stringValue(Object value) {
         return value == null ? null : String.valueOf(value);
     }
 
+    /** 返回第一个非空白字符串，全部为空时返回 null。 */
     private String firstNonBlank(String... values) {
         for (String value : values) {
             if (value != null && !value.isBlank()) {

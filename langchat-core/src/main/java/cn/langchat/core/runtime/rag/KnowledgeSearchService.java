@@ -76,6 +76,9 @@ public class KnowledgeSearchService {
         return hits;
     }
 
+    /**
+     * 批量按文档 ID 加载文档记录并建立索引映射，避免命名回填时的 N+1 查询。
+     */
     private Map<String, AigcDocs> loadDocsMap(List<AigcSegment> segments) {
         List<String> docsIds = segments.stream()
                 .map(AigcSegment::getDocsId)
@@ -92,6 +95,10 @@ public class KnowledgeSearchService {
                 .collect(Collectors.toMap(AigcDocs::getId, Function.identity(), (left, right) -> left));
     }
 
+    /**
+     * 将切片记录转换为检索命中结果：按评分公式计算相似度得分，
+     * 并回填知识库名称、文档名称、截断正文与元数据。
+     */
     private KnowledgeSearchHit toHit(
             AigcSegment segment,
             String query,
@@ -114,6 +121,9 @@ public class KnowledgeSearchService {
         return hit;
     }
 
+    /**
+     * 构建命中元数据：知识库、文档、分段标识 + 位置与得分，供前端渲染引用来源。
+     */
     private Map<String, Object> buildMetadata(AigcSegment segment, AigcKnowledge knowledge, AigcDocs docs, double score) {
         Map<String, Object> metadata = new LinkedHashMap<>();
         putIfPresent(metadata, "knowledgeId", segment.getKnowledgeId());
@@ -127,6 +137,9 @@ public class KnowledgeSearchService {
         return metadata;
     }
 
+    /**
+     * 简易关键词评分：词频×2 + 首次命中加分 + 分段位置权重（越靠前加分越多）。
+     */
     private double calculateScore(String content, String query, Integer position) {
         String safeContent = content == null ? "" : content.toLowerCase();
         String safeQuery = query.toLowerCase();
@@ -137,6 +150,7 @@ public class KnowledgeSearchService {
         return frequency * 2.0D + exactMatchBonus + positionBonus;
     }
 
+    /** 统计查询词在内容中完整出现的次数。 */
     private int countOccurrences(String content, String query) {
         if (query.isBlank()) {
             return 0;
@@ -153,6 +167,7 @@ public class KnowledgeSearchService {
         return count;
     }
 
+    /** 命中正文最多保留 300 字符，超长部分截断。 */
     private String trimContent(String content) {
         if (content == null) {
             return "";
@@ -160,10 +175,12 @@ public class KnowledgeSearchService {
         return content.length() <= 300 ? content : content.substring(0, 300);
     }
 
+    /** 归一化 topK：未配置或非正值时回退默认值 5。 */
     private int normalizeTopK(Integer topK) {
         return topK == null || topK <= 0 ? DEFAULT_TOP_K : topK;
     }
 
+    /** 值非 null 时才写入元数据，避免出现 null 字段。 */
     private void putIfPresent(Map<String, Object> metadata, String key, Object value) {
         if (value != null) {
             metadata.put(key, value);
